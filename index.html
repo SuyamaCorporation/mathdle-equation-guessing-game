@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mathdle Daily Equation Guessing Game</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  .tile { transition: background-color 0.2s, border-color 0.2s; }
+  .tile-correct   { background-color: #16a34a; border-color: #16a34a; color: white; }
+  .tile-present   { background-color: #d97706; border-color: #d97706; color: white; }
+  .tile-absent    { background-color: #374151; border-color: #374151; color: #9ca3af; }
+  .tile-empty     { background-color: transparent; border-color: #4b5563; }
+  .tile-current   { border-color: #9ca3af; }
+  .key-correct  { background-color: #16a34a !important; color: white !important; }
+  .key-present  { background-color: #d97706 !important; color: white !important; }
+  .key-absent   { background-color: #374151 !important; color: #9ca3af !important; }
+</style>
+</head>
+<body class="bg-gray-950 min-h-screen font-sans text-white">
+<div class="max-w-lg mx-auto px-4 py-6">
+  <div class="flex items-center justify-between mb-1">
+    <h1 class="text-2xl font-bold text-green-400">Mathdle</h1>
+    <div class="text-sm text-gray-400" id="date-display"></div>
+  </div>
+  <p class="text-gray-500 text-sm mb-4">Guess the hidden equation in 6 tries</p>
+
+  <!-- Legend -->
+  <div class="flex gap-4 text-xs text-gray-400 mb-4 justify-center">
+    <span class="flex items-center gap-1"><span class="inline-block w-4 h-4 rounded bg-green-600"></span> Correct position</span>
+    <span class="flex items-center gap-1"><span class="inline-block w-4 h-4 rounded bg-yellow-600"></span> Wrong position</span>
+    <span class="flex items-center gap-1"><span class="inline-block w-4 h-4 rounded bg-gray-700"></span> Not in equation</span>
+  </div>
+
+  <!-- Status -->
+  <div id="status-msg" class="text-center text-sm h-6 mb-3 font-medium" aria-live="assertive"></div>
+
+  <!-- Grid -->
+  <div id="grid" class="grid gap-1.5 mx-auto mb-5" role="grid" aria-label="Mathdle guess grid"></div>
+
+  <!-- Keyboard -->
+  <div id="keyboard" class="space-y-1.5" aria-label="On-screen keyboard" role="group"></div>
+
+  <!-- New game (for non-daily) -->
+  <div class="text-center mt-5">
+    <button id="new-game-btn" class="px-5 py-2 bg-green-700 hover:bg-green-600 rounded-lg text-sm font-semibold transition" aria-label="Start new random game">New Random Game</button>
+    <div class="text-xs text-gray-500 mt-2">Daily puzzle resets at midnight. Random game for extra practice.</div>
+  </div>
+</div>
+
+<script>
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+// === Equation generator ===
+// Format: a OP b = c  or  a OP b OP c = d
+// We'll use 8-character equations: like "3+5*2=13" or "12-4*2=4"
+// Length 8: "X+X*X=XX" or "XX+XX=XX"
+
+function generateEquations(seed) {
+  // Generate a pool of valid equations deterministically from seed
+  const rng = mulberry32(seed);
+  const equations = [];
+
+  const ops = ['+', '-', '*'];
+  for (let attempts = 0; attempts < 2000 && equations.length < 100; attempts++) {
+    const opIdx = Math.floor(rng() * 3);
+    const op = ops[opIdx];
+    let eq = null;
+
+    if (op === '+') {
+      const a = Math.floor(rng() * 19) + 1;
+      const b = Math.floor(rng() * 19) + 1;
+      const c = a + b;
+      if (c >= 1 && c <= 99) eq = a + '+' + b + '=' + c;
+    } else if (op === '-') {
+      const a = Math.floor(rng() * 19) + 2;
+      const b = Math.floor(rng() * (a - 1)) + 1;
+      const c = a - b;
+      if (c >= 1) eq = a + '-' + b + '=' + c;
+    } else {
+      const a = Math.floor(rng() * 9) + 2;
+      const b = Math.floor(rng() * 9) + 2;
+      const c = a * b;
+      if (c <= 99) eq = a + '*' + b + '=' + c;
+    }
+
+    if (eq && eq.length === 7 || eq && eq.length === 8) {
+      equations.push(eq);
+    }
+  }
+  return equations;
+}
+
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function getDailySeed() {
+  const now = new Date();
+  return now.getFullYear() * 10000 + (now.getMonth()+1) * 100 + now.getDate();
+}
+
+function pickDaily() {
+  const seed = getDailySeed();
+  const eqs = generateEquations(seed);
+  if (eqs.length === 0) return '3+5=8  '; // fallback
+  return eqs[0];
+}
+
+function pickRandom() {
+  const seed = Math.floor(Math.random() * 999999);
+  const eqs = generateEquations(seed);
+  if (eqs.length === 0) return '4*3=12 ';
+  return eqs[Math.floor(Math.random() * Math.min(eqs.length, 20))];
+}
+
+// === Game state ===
+const MAX_TRIES = 6;
+let target = '';
+let EQ_LEN = 8;
+let guesses = [];
+let currentGuess = [];
+let gameOver = false;
+let keyStates = {};
+
+function startGame(eq) {
+  target = eq;
+  EQ_LEN = eq.length;
+  guesses = [];
+  currentGuess = [];
+  gameOver = false;
+  keyStates = {};
+  document.getElementById('status-msg').textContent = '';
+  buildGrid();
+  buildKeyboard();
+}
+
+function buildGrid() {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  grid.style.gridTemplateColumns = 'repeat(' + EQ_LEN + ', 1fr)';
+  grid.style.maxWidth = (EQ_LEN * 52) + 'px';
+
+  for (let row = 0; row < MAX_TRIES; row++) {
+    for (let col = 0; col < EQ_LEN; col++) {
+      const cell = document.createElement('div');
+      cell.id = 'cell-' + row + '-' + col;
+      cell.className = 'tile w-12 h-12 border-2 tile-empty flex items-center justify-center text-xl font-bold rounded uppercase';
+      cell.setAttribute('role', 'gridcell');
+      cell.setAttribute('aria-label', 'Row ' + (row+1) + ' column ' + (col+1));
+      grid.appendChild(cell);
+    }
+  }
+}
+
+const KEYS = [
+  ['1','2','3','4','5','6','7','8','9','0'],
+  ['+','-','*','=','⌫'],
+  ['Enter']
+];
+
+function buildKeyboard() {
+  const kb = document.getElementById('keyboard');
+  kb.innerHTML = '';
+  for (const row of KEYS) {
+    const rowDiv = document.createElement('div');
+    rowDiv.className = 'flex gap-1.5 justify-center';
+    for (const k of row) {
+      const btn = document.createElement('button');
+      const isWide = k === 'Enter' || k === '⌫';
+      btn.className = 'key rounded font-bold text-sm bg-gray-700 hover:bg-gray-600 text-white transition ' + (isWide ? 'px-4 py-3 min-w-[64px]' : 'w-10 h-10 flex items-center justify-center');
+      btn.textContent = k;
+      btn.dataset.key = k;
+      btn.setAttribute('aria-label', k === '⌫' ? 'Backspace' : k === 'Enter' ? 'Submit guess' : k);
+      btn.addEventListener('click', () => handleKey(k));
+      rowDiv.appendChild(btn);
+    }
+    kb.appendChild(rowDiv);
+  }
+}
+
+function updateGridRow(rowIdx, guess, result) {
+  for (let col = 0; col < EQ_LEN; col++) {
+    const cell = document.getElementById('cell-' + rowIdx + '-' + col);
+    cell.textContent = guess[col] || '';
+    cell.className = 'tile w-12 h-12 border-2 flex items-center justify-center text-xl font-bold rounded uppercase ';
+    if (result) {
+      if (result[col] === 'correct') cell.className += 'tile-correct';
+      else if (result[col] === 'present') cell.className += 'tile-present';
+      else cell.className += 'tile-absent';
+    } else {
+      cell.className += 'tile-empty tile-current';
+    }
+  }
+}
+
+function updateCurrentRow() {
+  const rowIdx = guesses.length;
+  for (let col = 0; col < EQ_LEN; col++) {
+    const cell = document.getElementById('cell-' + rowIdx + '-' + col);
+    cell.textContent = currentGuess[col] || '';
+    cell.className = 'tile w-12 h-12 border-2 flex items-center justify-center text-xl font-bold rounded uppercase ';
+    cell.className += currentGuess[col] ? 'tile-current' : 'tile-empty';
+  }
+}
+
+function grade(guess, target) {
+  const result = new Array(EQ_LEN).fill('absent');
+  const targetArr = target.split('');
+  const guessArr = guess.split('');
+  const usedT = new Array(EQ_LEN).fill(false);
+  const usedG = new Array(EQ_LEN).fill(false);
+
+  // Correct positions first
+  for (let i = 0; i < EQ_LEN; i++) {
+    if (guessArr[i] === targetArr[i]) {
+      result[i] = 'correct';
+      usedT[i] = true;
+      usedG[i] = true;
+    }
+  }
+  // Present elsewhere
+  for (let i = 0; i < EQ_LEN; i++) {
+    if (usedG[i]) continue;
+    for (let j = 0; j < EQ_LEN; j++) {
+      if (!usedT[j] && guessArr[i] === targetArr[j]) {
+        result[i] = 'present';
+        usedT[j] = true;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+function isValidEquation(eq) {
+  if (eq.length !== EQ_LEN) return false;
+  if (!eq.includes('=')) return false;
+  const eqIdx = eq.lastIndexOf('=');
+  const lhs = eq.substring(0, eqIdx);
+  const rhs = eq.substring(eqIdx + 1);
+  if (!lhs || !rhs) return false;
+  // Check valid characters
+  if (!/^[\d+\-*]+$/.test(lhs)) return false;
+  if (!/^\d+$/.test(rhs)) return false;
+  try {
+    const lval = Function('"use strict"; return (' + lhs + ')')();
+    const rval = parseInt(rhs, 10);
+    return lval === rval;
+  } catch(e) { return false; }
+}
+
+function handleKey(k) {
+  if (gameOver) return;
+  if (k === '⌫') {
+    if (currentGuess.length > 0) { currentGuess.pop(); updateCurrentRow(); }
+    return;
+  }
+  if (k === 'Enter') {
+    const guess = currentGuess.join('');
+    if (guess.length < EQ_LEN) {
+      showStatus('Not enough characters — equation must be ' + EQ_LEN + ' characters long', 'yellow');
+      return;
+    }
+    if (!isValidEquation(guess)) {
+      showStatus('Invalid equation — must be mathematically correct', 'red');
+      return;
+    }
+    const result = grade(guess, target);
+    const rowIdx = guesses.length;
+    guesses.push({ guess, result });
+    updateGridRow(rowIdx, guess, result);
+    updateKeyStates(guess, result);
+
+    if (guess === target) {
+      gameOver = true;
+      showStatus('🎉 Correct! Solved in ' + guesses.length + ' tries', 'green');
+      return;
+    }
+    if (guesses.length >= MAX_TRIES) {
+      gameOver = true;
+      showStatus('Game over! Answer was: ' + target, 'red');
+      return;
+    }
+    currentGuess = [];
+    updateCurrentRow();
+    document.getElementById('status-msg').textContent = '';
+    return;
+  }
+  if (currentGuess.length >= EQ_LEN) return;
+  currentGuess.push(k);
+  updateCurrentRow();
+}
+
+function updateKeyStates(guess, result) {
+  for (let i = 0; i < guess.length; i++) {
+    const ch = guess[i];
+    const r = result[i];
+    const cur = keyStates[ch];
+    if (cur === 'correct') continue;
+    if (r === 'correct') keyStates[ch] = 'correct';
+    else if (r === 'present' && cur !== 'correct') keyStates[ch] = 'present';
+    else if (!cur) keyStates[ch] = 'absent';
+  }
+  // Update keyboard UI
+  document.querySelectorAll('[data-key]').forEach(btn => {
+    const k = btn.dataset.key;
+    btn.classList.remove('key-correct','key-present','key-absent');
+    if (keyStates[k]) btn.classList.add('key-' + keyStates[k]);
+  });
+}
+
+function showStatus(msg, color) {
+  const el = document.getElementById('status-msg');
+  el.textContent = msg;
+  el.className = 'text-center text-sm h-6 mb-3 font-medium ';
+  if (color === 'green') el.className += 'text-green-400';
+  else if (color === 'red') el.className += 'text-red-400';
+  else if (color === 'yellow') el.className += 'text-yellow-400';
+  else el.className += 'text-gray-300';
+}
+
+// Keyboard input
+document.addEventListener('keydown', e => {
+  const key = e.key;
+  if (key === 'Backspace') { handleKey('⌫'); return; }
+  if (key === 'Enter') { handleKey('Enter'); return; }
+  if (/^[0-9+\-*=]$/.test(key)) { handleKey(key); }
+});
+
+// Date display
+const now = new Date();
+document.getElementById('date-display').textContent = now.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'});
+
+// New random game button
+document.getElementById('new-game-btn').addEventListener('click', () => {
+  startGame(pickRandom());
+  showStatus('New random game started!', 'green');
+  setTimeout(() => { if (!gameOver) document.getElementById('status-msg').textContent = ''; }, 1500);
+});
+
+// Load daily (or saved) state
+const savedKey = 'mathdle-' + getDailySeed();
+let savedState = null;
+try { savedState = JSON.parse(localStorage.getItem(savedKey)); } catch(e) {}
+
+const dailyEq = pickDaily();
+startGame(dailyEq);
+
+if (savedState && savedState.target === dailyEq) {
+  // Replay saved guesses
+  for (const { guess, result } of savedState.guesses) {
+    const rowIdx = guesses.length;
+    guesses.push({ guess, result });
+    updateGridRow(rowIdx, guess, result);
+    updateKeyStates(guess, result);
+  }
+  if (savedState.gameOver) {
+    gameOver = true;
+    if (savedState.won) showStatus('Already solved today! Answer: ' + dailyEq, 'green');
+    else showStatus('Game over! Answer was: ' + dailyEq, 'red');
+  }
+}
+
+// Save state on each guess
+const origHandleKey = handleKey;
+window.handleKey = function(k) {
+  origHandleKey(k);
+  // Save after each completed guess
+  if (k === 'Enter' && guesses.length > 0) {
+    try {
+      localStorage.setItem(savedKey, JSON.stringify({
+        target: dailyEq,
+        guesses: guesses,
+        gameOver,
+        won: gameOver && guesses[guesses.length-1]?.guess === dailyEq
+      }));
+    } catch(e) {}
+  }
+};
+
+// Repoint keyboard and physical keyboard to wrapped version
+document.querySelectorAll('[data-key]').forEach(btn => {
+  btn.removeEventListener('click', () => {});
+  btn.addEventListener('click', () => window.handleKey(btn.dataset.key));
+});
+document.removeEventListener('keydown', () => {});
+document.addEventListener('keydown', e => {
+  const key = e.key;
+  if (key === 'Backspace') { window.handleKey('⌫'); return; }
+  if (key === 'Enter') { window.handleKey('Enter'); return; }
+  if (/^[0-9+\-*=]$/.test(key)) { window.handleKey(key); }
+});
+</script>
+</body>
+</html>
